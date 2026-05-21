@@ -117,7 +117,9 @@ class _ImageURL(BaseModel):
 
 
 class _FileURL(BaseModel):
-    url: str  # base64 data URI or HTTP URL
+    url: str  # base64 data URI, HTTP URL, or TOS URI from /v1/files
+    name: Optional[str] = None  # filename (required when using TOS URI)
+    size: Optional[int] = None  # file size in bytes (required when using TOS URI)
 
 
 class _ContentPart(BaseModel):
@@ -666,7 +668,17 @@ def create_app(
             if part.type != "file_url" or part.file_url is None:
                 continue
             url = part.file_url.url
-            if url.startswith("data:"):
+            # Already uploaded via /v1/files — reuse TOS URI directly
+            if url.startswith("tos-cn-i-") or ("ocean-cloud-tos/" in url and not url.startswith("http")):
+                name = part.file_url.name or url.rsplit("/", 1)[-1]
+                ext = name.rsplit(".", 1)[-1] if "." in name else ""
+                uploaded.append(UploadedFile(
+                    uri=url,
+                    name=name,
+                    size=part.file_url.size or 0,
+                    file_type=ext,
+                ))
+            elif url.startswith("data:"):
                 # data:[<mediatype>][;base64],<data>
                 if "," not in url:
                     raise HTTPException(status_code=400, detail="Malformed data URI")
@@ -678,7 +690,9 @@ def create_app(
                     ext = "pdf"
                 elif "csv" in header:
                     ext = "csv"
-                filename = f"upload.{ext}"
+                filename = part.file_url.name or f"upload.{ext}"
+                uf = await client.upload_file(file_bytes, filename)
+                uploaded.append(uf)
             else:
                 # HTTP(S) URL — download the file
                 import aiohttp as _aio
@@ -691,11 +705,11 @@ def create_app(
                 # Extract filename from URL
                 from urllib.parse import urlparse as _urlparse
                 path = _urlparse(url).path
-                filename = path.rsplit("/", 1)[-1] if "/" in path else "upload.txt"
+                filename = part.file_url.name or (path.rsplit("/", 1)[-1] if "/" in path else "upload.txt")
                 if "." not in filename:
                     filename = "upload.txt"
-            uf = await client.upload_file(file_bytes, filename)
-            uploaded.append(uf)
+                uf = await client.upload_file(file_bytes, filename)
+                uploaded.append(uf)
         return uploaded
 
     # ── SSE streaming generator for chat ──
