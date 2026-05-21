@@ -627,7 +627,13 @@ def create_app(
             if part.type != "image_url" or part.image_url is None:
                 continue
             url = part.image_url.url
-            if url.startswith("data:"):
+            # Already uploaded via /v1/images/upload — extract key directly
+            if "tos-cn-i-" in url:
+                # CDN URL from previous upload, extract URI key
+                from urllib.parse import urlparse as _urlparse
+                path = _urlparse(url).path.lstrip("/")
+                attachments.append({"uri": path, "cdn_url": url, "name": "upload.png", "format": "png", "width": "64", "height": "64"})
+            elif url.startswith("data:"):
                 if "," not in url:
                     raise HTTPException(status_code=400, detail="Malformed data URI: missing comma")
                 header, b64data = url.split(",", 1)
@@ -1097,6 +1103,58 @@ def create_app(
             "uri": uploaded.uri,
             "file_type": uploaded.file_type,
             "purpose": "assistants",
+        })
+
+    # ── POST /v1/images/upload (upload image for chat, returns usable URL) ──
+
+    @app.post("/v1/images/upload")
+    async def upload_image_endpoint(request: Request):
+        """Upload an image via multipart/form-data for use in chat.
+
+        Returns a URL that can be directly used in image_url content parts,
+        avoiding the need to base64-encode large images.
+
+        Example:
+            curl -F "file=@photo.jpg" http://host:9090/v1/images/upload
+            -> {"url": "https://...", "key": "tos-cn-i-.../xxx.png"}
+
+        Then use in chat:
+            {"type": "image_url", "image_url": {"url": "<returned url>"}}
+        """
+        _check_auth(request)
+        content_type = request.headers.get("content-type", "")
+        if "multipart" not in content_type:
+            raise HTTPException(
+                status_code=400,
+                detail="Expected multipart/form-data with a 'file' field",
+            )
+
+        form = await request.form()
+        file_field = form.get("file")
+        if file_field is None:
+            raise HTTPException(status_code=400, detail="Missing 'file' field")
+
+        img_bytes = await file_field.read()
+        filename = getattr(file_field, "filename", None) or "upload.png"
+
+        await bucket.acquire()
+        try:
+            client = await _get_client()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        try:
+            att = await client.upload_image(img_bytes, filename)
+        except DoubaoChatError as exc:
+            raise HTTPException(status_code=502, detail=f"Image upload: {exc}")
+
+        return JSONResponse({
+            "url": att.get("cdn_url", ""),
+            "key": att.get("uri", ""),
+            "filename": filename,
+            "bytes": len(img_bytes),
         })
 
     # ── POST /v1/chat/completions ──
