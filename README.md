@@ -8,19 +8,22 @@
 [![GitHub Issues](https://img.shields.io/github/issues/wangchuxiaoji-oss/doubao2api)](https://github.com/wangchuxiaoji-oss/doubao2api/issues)
 [![GitHub Last Commit](https://img.shields.io/github/last-commit/wangchuxiaoji-oss/doubao2api)](https://github.com/wangchuxiaoji-oss/doubao2api/commits/main)
 
-逆向工程豆包（Doubao）API，提供完整可用的 Python 异步客户端和 OpenAI 兼容 REST 服务。支持多轮对话（含深度思考/联网搜索）、图片生成、视频生成、音乐生成、文件上传，以及 QR 扫码登录和自动验证码处理。
+逆向豆包（Doubao）客户端 API，为 AI 智能体提供免费的多模态能力。通过 OpenAI 兼容接口，让任何纯文本模型也能识图、读文件、生成图片/音乐/视频。
 
-> **适用场景**：本项目适合为通用 AI 智能体（如 OpenClaw、Hermes 等对话/任务型 Agent）补全多模态能力。
->
-> 举个实际例子：我的 Hermes Agent 接入的是 DeepSeek V4 Flash——一个纯文本模型，看不了图、读不了文件、更不能生成多媒体内容。接入 doubao2api 之后，相当于给它装上了"眼睛"和"手"：
->
-> - **多模态理解**：识图、读 PDF/Word/Excel/代码等 60+ 种文件格式，纯文本模型也能"看懂"图片和文档
-> - **多媒体生成**：免费生成图片（文生图、图生图）、音乐、视频，Agent 的输出不再局限于文字
-> - **文件中转站**（奇淫技巧）：通过 `/v1/files` 可上传任意文件（最大 1GB）获得一个永久 TOS URI，之后随时凭这个 URI 调用 `/v1/files/download` 换取 7 天有效的下载链接，过期了再换一个就行。这意味着你可以把它当作**免费的跨机器文件传输通道**——Agent A 在服务器 A 上传文件拿到 URI，把 URI 传给 Agent B，Agent B 在另一台服务器上凭 URI 获取下载链接直接拉取文件。无需自建 OSS，无需打通内网，单文件最大 1GB，存储不过期。有兴趣的兄弟可以基于这个开做个文件中转，感觉会很不错
->
-> 但请注意：豆包客户端模型**不支持 Function Calling / Tool Use**（无法调用外部工具如文件读写、终端命令、代码搜索等），因此**不适合**作为编程智能体（Claude Code、Codex、OpenCode 等）的后端模型。如果你需要的是能操作代码仓库的 coding agent，请选择原生支持工具调用的模型 API。
+起初只是想给自己的 Hermes Agent（基于 DeepSeek V4 Flash）补上识图能力，结果越写越多，索性做成了完整的逆向客户端和 API 服务。
 
-> 起初只是想给自己的 Hermes Agent（基于 DeepSeek V4 Flash）补上识图能力，结果越写越多，索性做成了完整的逆向客户端和 API 服务。
+## 这个项目能做什么
+
+本项目适合为通用 AI 智能体（如 OpenClaw、Hermes 等对话/任务型 Agent）补全多模态能力。
+
+举个实际例子：我的 Hermes Agent 接入的是 DeepSeek V4 Flash——一个纯文本模型，看不了图、读不了文件、更不能生成多媒体内容。接入 doubao2api 之后，相当于给它装上了"眼睛"和"手"：
+
+- **多模态对话**：多轮对话、深度思考（思维链）、联网搜索，完整的 ChatCompletion 能力
+- **多模态理解**：识图、读 PDF/Word/Excel/代码等 60+ 种文件格式，纯文本模型也能"看懂"图片和文档
+- **多媒体生成**：免费生成图片（文生图、图生图）、音乐、视频，Agent 的输出不再局限于文字
+- **文件中转站**（奇淫技巧）：通过 `/v1/files` 可上传任意文件（最大 1GB）获得一个永久 TOS URI，之后随时凭这个 URI 调用 `/v1/files/download` 换取 7 天有效的下载链接，过期了再换一个就行。这意味着你可以把它当作**免费的跨机器文件传输通道**——Agent A 在服务器 A 上传文件拿到 URI，把 URI 传给 Agent B，Agent B 在另一台服务器上凭 URI 获取下载链接直接拉取文件。无需自建 OSS，无需打通内网，单文件最大 1GB，存储不过期。有兴趣的兄弟可以基于这个开做个文件中转，感觉会很不错
+
+⚠️ **不适合编程智能体**：豆包客户端模型**不支持 Function Calling / Tool Use**（无法调用外部工具如文件读写、终端命令、代码搜索等），因此**不适合**作为编程智能体（Claude Code、Codex、OpenCode 等）的后端模型。如果你需要的是能操作代码仓库的 coding agent，请选择原生支持工具调用的模型 API。
 
 ## 原理
 
