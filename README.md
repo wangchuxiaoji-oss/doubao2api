@@ -1202,6 +1202,65 @@ curl http://localhost:9090/v1/files \
 
 ---
 
+#### GET /v1/files/download
+
+获取已上传文件的临时 CDN 下载链接。配合 `/v1/files` 使用，实现完整的上传→下载流程。
+
+**Query 参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `uri` | string | 是 | `/v1/files` 返回的 TOS URI |
+| `expire` | int | 否 | 期望有效期秒数（实际固定 7 天，此参数无效） |
+
+**curl 示例**：
+```bash
+curl "http://localhost:9090/v1/files/download?uri=tos-cn-i-ik7evvg4ik/xxx.txt"
+```
+
+**响应**：
+```json
+{
+  "url": "https://p3-flow-sign.byteimg.com/tos-cn-i-ik7evvg4ik/xxx.txt?x-expires=...",
+  "uri": "tos-cn-i-ik7evvg4ik/xxx.txt",
+  "expires_in": 3600
+}
+```
+
+| 响应字段 | 类型 | 说明 |
+|----------|------|------|
+| `url` | string | CDN 下载链接（有效期 7 天） |
+| `uri` | string | 原始 TOS URI |
+| `expires_in` | int | 请求的过期时间（实际由服务端决定） |
+
+**完整上传→下载流程**：
+```bash
+# 1. 上传文件
+RESPONSE=$(curl -s http://localhost:9090/v1/files -F "file=@myfile.pdf")
+URI=$(echo $RESPONSE | jq -r '.uri')
+echo "上传成功: $URI"
+
+# 2. 获取下载链接（可反复调用，每次返回新的 7 天有效 URL）
+DOWNLOAD_URL=$(curl -s "http://localhost:9090/v1/files/download?uri=$URI" | jq -r '.url')
+
+# 3. 下载文件
+curl -o downloaded.pdf "$DOWNLOAD_URL"
+```
+
+**存储特性**：
+
+| 项目 | 限制 |
+|------|------|
+| 单文件大小上限 | **1 GB** |
+| 上传速度 | ~7 MB/s（取决于网络） |
+| 下载 URL 有效期 | **固定 7 天**（expire 参数无效） |
+| URI 持久性 | 可无限次重新获取下载 URL（相当于永久存储） |
+| 支持格式 | 60+ 种（PDF/DOCX/代码/图片等，见支持列表） |
+
+> URI 只要记住就能反复获取新的下载链接，不会过期。相当于一个免费的 1GB/文件对象存储。
+
+---
+
 #### POST /v1/images/upload
 
 图片上传端点。上传图片后返回 CDN URL，可直接用于 `/v1/chat/completions` 的 `image_url` 内容类型，**无需 base64 编码**。
