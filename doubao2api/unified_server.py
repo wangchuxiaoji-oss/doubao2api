@@ -1124,7 +1124,7 @@ def create_app(
     # ── GET /v1/files/download (get CDN download URL for uploaded file) ──
 
     @app.get("/v1/files/download")
-    async def download_file_endpoint(request: Request, uri: str):
+    async def download_file_endpoint(request: Request, uri: str, expire: int = 3600):
         """Get a temporary CDN download URL for a previously uploaded file.
 
         Query params:
@@ -1146,14 +1146,14 @@ def create_app(
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         try:
-            download_url = await client.get_file_download_url(uri)
+            download_url = await client.get_file_download_url(uri, expire_seconds=expire)
         except DoubaoChatError as exc:
             raise HTTPException(status_code=502, detail=f"Get download URL: {exc}")
 
         return JSONResponse({
             "url": download_url,
             "uri": uri,
-            "expires_in": 3600,
+            "expires_in": expire,
         })
 
     # ── POST /v1/images/upload (upload image for chat, returns usable URL) ──
