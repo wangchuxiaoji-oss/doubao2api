@@ -1121,6 +1121,41 @@ def create_app(
             "purpose": "assistants",
         })
 
+    # ── GET /v1/files/download (get CDN download URL for uploaded file) ──
+
+    @app.get("/v1/files/download")
+    async def download_file_endpoint(request: Request, uri: str):
+        """Get a temporary CDN download URL for a previously uploaded file.
+
+        Query params:
+            uri: TOS URI from /v1/files upload response.
+
+        Returns:
+            {"url": "https://...", "uri": "tos-cn-i-.../xxx.pdf", "expires_in": 3600}
+        """
+        _check_auth(request)
+        if not uri:
+            raise HTTPException(status_code=400, detail="Missing 'uri' query param")
+
+        await bucket.acquire()
+        try:
+            client = await _get_client()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        try:
+            download_url = await client.get_file_download_url(uri)
+        except DoubaoChatError as exc:
+            raise HTTPException(status_code=502, detail=f"Get download URL: {exc}")
+
+        return JSONResponse({
+            "url": download_url,
+            "uri": uri,
+            "expires_in": 3600,
+        })
+
     # ── POST /v1/images/upload (upload image for chat, returns usable URL) ──
 
     @app.post("/v1/images/upload")

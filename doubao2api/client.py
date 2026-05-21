@@ -2263,6 +2263,52 @@ class DoubaoChatClient:
             "height": "64",
         }
 
+    async def get_file_download_url(
+        self,
+        uri: str,
+        expire_seconds: int = 3600,
+    ) -> str:
+        """Get a temporary CDN download URL for a previously uploaded file.
+
+        Args:
+            uri: TOS URI from upload_file() or upload_image().
+            expire_seconds: URL validity period (default 1 hour, max unknown).
+
+        Returns:
+            Public CDN URL string for downloading the file.
+        """
+        params = self._security_params()
+        ext = uri.rsplit(".", 1)[-1] if "." in uri else ""
+        file_url_endpoint = (
+            f"{self.BASE_URL}/alice/message/get_file_url?"
+            f"{urlencode(params)}"
+        )
+        async with self.session.post(
+            file_url_endpoint,
+            json={
+                "uris": [uri],
+                "type": "file",
+                "format": ext,
+                "expire_second": expire_seconds,
+            },
+            headers={"Content-Type": "application/json"},
+        ) as resp:
+            if resp.status != 200:
+                raise DoubaoChatError(
+                    f"get_file_url failed ({resp.status}): "
+                    f"{(await resp.text())[:500]}"
+                )
+            body = await resp.json()
+            if body.get("code") != 0:
+                raise DoubaoChatError(
+                    f"get_file_url error: {body.get('msg', body)}"
+                )
+            data = body.get("data", {})
+            file_urls = data.get("file_urls", []) if isinstance(data, dict) else []
+            if not file_urls:
+                raise DoubaoChatError("get_file_url returned no file_urls")
+            return file_urls[0].get("main_url", "")
+
     @classmethod
     def from_session(
         cls,
