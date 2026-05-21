@@ -627,11 +627,13 @@ def create_app(
             if part.type != "image_url" or part.image_url is None:
                 continue
             url = part.image_url.url
-            # Already uploaded via /v1/images/upload — extract key directly
-            if "tos-cn-i-" in url:
-                # CDN URL from previous upload, extract URI key
+            # Already uploaded via /v1/images/upload — extract key from CDN URL
+            if "byteimg.com" in url and "ocean-cloud-tos/" in url:
                 from urllib.parse import urlparse as _urlparse
                 path = _urlparse(url).path.lstrip("/")
+                # Remove CDN template suffix: xxx.webp~tplv-xxx -> xxx.webp
+                if "~" in path:
+                    path = path.split("~")[0]
                 attachments.append({"uri": path, "cdn_url": url, "name": "upload.png", "format": "png", "width": "64", "height": "64"})
             elif url.startswith("data:"):
                 if "," not in url:
