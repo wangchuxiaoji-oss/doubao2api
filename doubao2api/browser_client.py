@@ -369,12 +369,15 @@ class BrowserClient:
         text: str,
         conversation_id: Optional[str] = None,
         use_deep_think: bool = False,
-        timeout: int = 60,
+        timeout: int = 120,
     ) -> Dict[str, Any]:
         """Send a message via UI simulation (type + Enter).
 
         This is the primary method - it uses the frontend's own code path,
         which handles captcha/rate-limiting automatically.
+
+        If a captcha is triggered (710022004), waits for the user to solve it
+        via noVNC, then captures the retry response.
 
         Returns dict with keys: text, conversation_id, events
         """
@@ -395,12 +398,23 @@ class BrowserClient:
             await asyncio.sleep(1)
 
         # Set up route interception AFTER navigation
-        captured = {"body": None, "done": asyncio.Event()}
+        # We capture ALL responses - if first is captcha error, wait for retry
+        captured = {"body": None, "done": asyncio.Event(), "captcha": False}
 
         async def _intercept(route):
             try:
                 response = await route.fetch()
                 body = await response.text()
+
+                # Check if this is a captcha error
+                if "710022004" in body and not captured["captcha"]:
+                    # First response is captcha - let frontend handle it
+                    captured["captcha"] = True
+                    log.warning("Captcha triggered (710022004), waiting for user to solve via noVNC...")
+                    await route.fulfill(response=response, body=body)
+                    return  # Don't signal done yet - wait for retry
+
+                # This is either a success response or the retry after captcha
                 captured["body"] = body
                 captured["done"].set()
                 await route.fulfill(response=response, body=body)
@@ -422,10 +436,15 @@ class BrowserClient:
             await asyncio.sleep(0.2)
             await self._page.keyboard.press("Enter")
 
-            # Wait for response
+            # Wait for response (longer timeout if captcha might appear)
             try:
                 await asyncio.wait_for(captured["done"].wait(), timeout=timeout)
             except asyncio.TimeoutError:
+                if captured["captcha"]:
+                    raise RuntimeError(
+                        "Captcha triggered but not solved within timeout. "
+                        "Please solve it via noVNC at http://<host>:6080/vnc.html"
+                    )
                 raise RuntimeError(f"Timeout waiting for response ({timeout}s)")
         finally:
             await self._page.unroute("**/chat/completion*")
@@ -433,7 +452,7 @@ class BrowserClient:
         # Parse SSE response
         events = self._parse_sse(captured["body"])
 
-        # Check for errors
+        # Check for errors (shouldn't happen after captcha is solved, but just in case)
         for e in events:
             if e.get("error_code"):
                 raise RuntimeError(
