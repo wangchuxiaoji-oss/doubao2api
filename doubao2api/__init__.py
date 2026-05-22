@@ -1,5 +1,6 @@
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
+from .browser_client import BrowserClient
 from .captcha_handler import AutoCaptchaHandler, CaptchaHandler
 from .client import (
     DEFAULT_BOT_ID,
@@ -22,6 +23,7 @@ from .client import (
 from .session import load_cookies, load_session, save_params
 
 __all__ = [
+    "BrowserClient",
     "ChatMessage",
     "ChatResult",
     "CompletionChunk",
