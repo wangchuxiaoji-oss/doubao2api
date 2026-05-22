@@ -402,6 +402,23 @@ def create_app(
             "web_id": client._web_id or "",
         }
 
+    @app.post("/auth/eval")
+    async def auth_eval(request: Request):
+        """Evaluate JS on the browser page (debug only)."""
+        _check_auth(request)
+        client = _browser.get("client")
+        if client is None or client.page is None:
+            raise HTTPException(status_code=503, detail="Browser not available")
+        body = await request.json()
+        js = body.get("js", "")
+        if not js:
+            raise HTTPException(status_code=400, detail="Missing 'js' field")
+        try:
+            result = await client.page.evaluate(js)
+            return {"result": result}
+        except Exception as e:
+            return {"error": str(e)}
+
     @app.get("/auth/screenshot")
     async def auth_screenshot(request: Request):
         """Return a screenshot of the browser page (for remote QR viewing)."""
