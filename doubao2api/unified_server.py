@@ -104,6 +104,10 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Ensure browser_client logs are visible
+        logging.getLogger("doubao2api.browser_client").setLevel(logging.INFO)
+        logging.getLogger("doubao2api.browser_client").addHandler(logging.StreamHandler())
+
         # Start browser client
         headless = os.environ.get("DOUBAO_HEADLESS", "true").lower() == "true"
         user_data_dir = os.environ.get(

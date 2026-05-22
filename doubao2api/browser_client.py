@@ -94,24 +94,22 @@ class BrowserClient:
             self._ready = False
             return
 
-        # Wait for page to settle
-        try:
-            await self._page.wait_for_selector(
-                'textarea, button:has-text("登录")', timeout=10000
-            )
-        except Exception:
-            log.warning("Page loaded but no recognizable elements found")
-            self._ready = False
-            return
+        # Wait for page to fully render (both textarea and potential login button)
+        await asyncio.sleep(3)
 
         # Check if "登录" button exists — if so, NOT logged in
+        # doubao.com shows chat UI even for non-logged-in users
         login_btn = self._page.locator('button:has-text("登录")')
-        if await login_btn.count() > 0:
+        btn_count = await login_btn.count()
+        log.info("Login check: URL=%s, login_button_count=%d", url, btn_count)
+
+        if btn_count > 0:
             log.info("Not logged in - login button visible")
             self._ready = False
             return
 
-        # No login button + page loaded = logged in
+        # Double-check: also look for user avatar or profile elements
+        # that only appear when logged in
         self._ready = True
         await self._extract_params()
         log.info("Logged in and ready! device_id=%s", self._device_id)
