@@ -90,21 +90,31 @@ class BrowserClient:
         """Check if we're logged in or need QR scan."""
         url = self._page.url
         if "security/doubao-region-ban" in url:
-            log.info("Not logged in - need QR scan login")
+            log.info("Not logged in - region ban page")
             self._ready = False
             return
 
-        # Check if chat page loaded (has input box)
+        # Wait for page to settle
         try:
             await self._page.wait_for_selector(
-                'textarea[placeholder*="发消息"]', timeout=10000
+                'textarea, button:has-text("登录")', timeout=10000
             )
-            self._ready = True
-            await self._extract_params()
-            log.info("Logged in and ready! bot_id=%s", self._bot_id)
         except Exception:
-            log.warning("Page loaded but chat input not found")
+            log.warning("Page loaded but no recognizable elements found")
             self._ready = False
+            return
+
+        # Check if "登录" button exists — if so, NOT logged in
+        login_btn = self._page.locator('button:has-text("登录")')
+        if await login_btn.count() > 0:
+            log.info("Not logged in - login button visible")
+            self._ready = False
+            return
+
+        # No login button + page loaded = logged in
+        self._ready = True
+        await self._extract_params()
+        log.info("Logged in and ready! device_id=%s", self._device_id)
 
     async def _extract_params(self):
         """Extract device_id, web_id, bot_id from page (retries for async localStorage population)."""
@@ -165,29 +175,31 @@ class BrowserClient:
 
         log.info("Waiting for QR scan login (timeout=%ds)...", timeout)
         try:
-            await self._page.wait_for_url(
-                "**/chat/**", timeout=timeout * 1000
-            )
-            await self._page.wait_for_selector(
-                'textarea[placeholder*="发消息"]', timeout=15000
-            )
-            self._ready = True
-            await self._extract_params()
-            log.info("Login successful!")
-            return True
+            # Wait for login button to disappear (indicates successful login)
+            login_btn = self._page.locator('button:has-text("登录")')
+            await login_btn.wait_for(state="hidden", timeout=timeout * 1000)
+            await asyncio.sleep(2)  # Let page settle after login
+
+            # Verify we're actually logged in
+            if await login_btn.count() == 0:
+                self._ready = True
+                await self._extract_params()
+                log.info("Login successful!")
+                return True
+            else:
+                log.warning("Login button still visible after wait")
+                return False
         except Exception as e:
             log.error("Login timeout: %s", e)
             return False
 
     async def _trigger_login_dialog(self):
-        """Click login button if on security/ban page."""
-        url = self._page.url
-        if "security/doubao-region-ban" in url:
-            btn = self._page.locator('button:has-text("登录")')
-            if await btn.count() > 0:
-                await btn.click()
-                log.info("Clicked login button, QR code should appear")
-                await asyncio.sleep(2)
+        """Click login button to show QR code dialog."""
+        btn = self._page.locator('button:has-text("登录")')
+        if await btn.count() > 0:
+            await btn.click()
+            log.info("Clicked login button, QR code should appear")
+            await asyncio.sleep(2)
 
     async def chat_completion(
         self,
