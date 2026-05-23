@@ -1,8 +1,11 @@
-"""Playwright-based Doubao client with httpx API calls.
+"""Playwright-based Doubao client with in-browser fetch.
 
 Architecture:
-- Playwright: Login (QR scan via noVNC) + page session + bdms.frontierSign signing
-- httpx: Actual API requests with streaming SSE support
+- Playwright: Login (QR scan via noVNC) + page session
+- In-browser fetch(): API requests go through ByteDance's fetch hook which
+  automatically injects a_bogus/msToken signatures with real browser fingerprint
+- httpx: Only used for file upload (TOS/ImageX flow, no fetch hook needed)
+- expose_function bridge: Streams SSE chunks from browser JS back to Python
 
 ByteDance's frontend exposes window.bdms.frontierSign() which generates
 X-Bogus signatures. We use Playwright only to maintain a logged-in page
@@ -31,7 +34,7 @@ DEFAULT_BOT_ID = "7338286299411103781"
 
 
 class BrowserClient:
-    """Manages Playwright for signing and httpx for API calls."""
+    """Manages Playwright for login and in-browser fetch for API calls."""
 
     def __init__(self, headless: bool = True, user_data_dir: Optional[str] = None):
         self.headless = headless
@@ -50,6 +53,9 @@ class BrowserClient:
         self._consecutive_failures: int = 0
         self._last_error_code: int = 0
         self._needs_captcha: bool = False
+        # Stream bridge: request_id -> asyncio.Queue for SSE chunks
+        self._stream_queues: Dict[str, asyncio.Queue] = {}
+        self._bridge_ready: bool = False
 
     @property
     def is_ready(self) -> bool:
@@ -196,8 +202,10 @@ class BrowserClient:
         self._ready = True
         await self._extract_params()
         await self._seed_ms_token()
-        await self._wait_for_signing()
-        log.info("Ready! device_id=%s", self._device_id)
+        await self._setup_fetch_bridge()
+        await self._verify_fetch_hook()
+        await self._wait_for_signing()  # still needed for upload endpoints
+        log.info("Ready! device_id=%s, fetch_hook=%s", self._device_id, self._bridge_ready)
 
     async def _extract_params(self):
         """Extract device_id, web_id, fp from localStorage/cookies."""
@@ -228,7 +236,7 @@ class BrowserClient:
                  self._device_id, self._web_id, self._fp[:20] if self._fp else "")
 
     async def _wait_for_signing(self):
-        """Wait for bdms.frontierSign to become available."""
+        """Wait for bdms.frontierSign to become available (legacy, kept for upload signing)."""
         for i in range(12):  # up to 60s
             has_sign = await self._page.evaluate(
                 "() => typeof window.bdms?.frontierSign === 'function'"
@@ -238,6 +246,46 @@ class BrowserClient:
                 return
             await asyncio.sleep(5)
         log.warning("bdms.frontierSign not available after 60s - signing may fail")
+
+    async def _setup_fetch_bridge(self):
+        """Register expose_function callback for streaming data from browser to Python."""
+        if self._bridge_ready:
+            return
+
+        async def _on_stream_chunk(request_id: str, chunk_json: str):
+            """Called from browser JS for each SSE chunk or completion signal."""
+            queue = self._stream_queues.get(request_id)
+            if queue:
+                await queue.put(chunk_json)
+
+        try:
+            await self._page.expose_function("__doubaoStreamChunk", _on_stream_chunk)
+            self._bridge_ready = True
+            log.info("Fetch bridge registered (expose_function ready)")
+        except Exception as e:
+            # May already be registered if page didn't navigate
+            if "already been registered" in str(e).lower():
+                self._bridge_ready = True
+                log.info("Fetch bridge already registered")
+            else:
+                log.error("Failed to register fetch bridge: %s", e)
+                raise
+
+    async def _verify_fetch_hook(self):
+        """Verify ByteDance's fetch interceptor is active (adds a_bogus)."""
+        for i in range(15):  # up to 30s
+            hooked = await self._page.evaluate("""() => {
+                try {
+                    const s = window.fetch.toString();
+                    return !s.includes('native code');
+                } catch(e) { return false; }
+            }""")
+            if hooked:
+                log.info("Fetch hook verified active after %ds", (i + 1) * 2)
+                return True
+            await asyncio.sleep(2)
+        log.warning("Fetch hook NOT detected after 30s - requests may fail")
+        return False
 
     async def wait_for_login(self, timeout: int = 120) -> bool:
         """Wait for user to scan QR code via noVNC."""
@@ -251,6 +299,8 @@ class BrowserClient:
                 self._ready = True
                 await self._extract_params()
                 await self._seed_ms_token()
+                await self._setup_fetch_bridge()
+                await self._verify_fetch_hook()
                 await self._wait_for_signing()
                 log.info("Login successful!")
                 return True
@@ -411,7 +461,7 @@ class BrowserClient:
         return headers
 
     # ------------------------------------------------------------------
-    # Chat Completion (streaming via httpx)
+    # Chat Completion (streaming via in-browser fetch)
     # ------------------------------------------------------------------
 
     async def chat_completion(
@@ -421,7 +471,7 @@ class BrowserClient:
         bot_id: Optional[str] = None,
         use_deep_think: int = 0,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Send a chat message and yield SSE events via httpx streaming."""
+        """Send a chat message and yield SSE events via in-browser fetch."""
         if not self._ready:
             raise RuntimeError("Browser not ready - need login first")
 
@@ -499,48 +549,140 @@ class BrowserClient:
             },
         }
 
+        # Build URL with query params (fetch hook will add a_bogus/msToken)
         query_params = self._build_query_params()
-        signed_url = await self._sign_url(COMPLETION_URL, query_params)
-        cookie_str = await self._get_cookies_string()
-        headers = self._build_headers(cookie_str)
+        query_string = "&".join(f"{k}={v}" for k, v in sorted(query_params.items()))
+        url = f"/chat/completion?{query_string}"
 
-        log.info("POST %s (conv=%s, deep_think=%s)",
-                 COMPLETION_URL, conversation_id or "new", use_deep_think)
+        request_id = f"req_{uuid.uuid4().hex[:16]}"
+        queue: asyncio.Queue = asyncio.Queue()
+        self._stream_queues[request_id] = queue
 
-        async with self._http.stream("POST", signed_url, headers=headers,
-                                     json=payload) as response:
-            # Rotate msToken from response header
-            new_ms_token = response.headers.get("x-ms-token", "")
-            if new_ms_token:
-                self._ms_token = new_ms_token
-            if response.status_code != 200:
-                body = await response.aread()
-                error_text = body.decode(errors="ignore")
-                log.error("API error %d: %s", response.status_code, error_text[:200])
-                yield {"error": True, "status": response.status_code, "body": error_text}
-                return
+        log.info("POST %s (conv=%s, deep_think=%s) [browser fetch]",
+                 url.split("?")[0], conversation_id or "new", use_deep_think)
 
-            current_event = ""
-            async for line in response.aiter_lines():
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("event: "):
-                    current_event = line[7:]
-                    continue
-                if line.startswith("id: "):
-                    continue
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:]
-                if not data_str or data_str == "{}":
-                    continue
+        # Launch browser fetch in background
+        eval_task = asyncio.create_task(
+            self._browser_fetch_stream(url, payload, request_id)
+        )
+
+        # Yield parsed SSE events from queue
+        try:
+            while True:
+                chunk_json = await asyncio.wait_for(queue.get(), timeout=180)
+                if chunk_json is None:
+                    # Stream complete
+                    break
+                if chunk_json.startswith("__ERROR__:"):
+                    error_msg = chunk_json[10:]
+                    log.error("Browser fetch error: %s", error_msg[:200])
+                    yield {"error": True, "status": 0, "body": error_msg}
+                    break
+                if chunk_json.startswith("__HTTP_ERROR__:"):
+                    status = int(chunk_json[15:].split(":", 1)[0])
+                    body = chunk_json[15:].split(":", 1)[1] if ":" in chunk_json[15:] else ""
+                    log.error("API error %d: %s", status, body[:200])
+                    yield {"error": True, "status": status, "body": body}
+                    break
+                # Parse SSE line
                 try:
-                    data = json.loads(data_str)
-                    data["_event"] = current_event
+                    data = json.loads(chunk_json)
                     yield data
                 except json.JSONDecodeError:
                     continue
+        except asyncio.TimeoutError:
+            log.error("Stream timeout (180s) for request %s", request_id)
+            yield {"error": True, "status": 0, "body": "Stream timeout"}
+        finally:
+            self._stream_queues.pop(request_id, None)
+            if not eval_task.done():
+                eval_task.cancel()
+            else:
+                # Check for exceptions
+                try:
+                    eval_task.result()
+                except Exception:
+                    pass
+
+    async def _browser_fetch_stream(
+        self, url: str, payload: Dict[str, Any], request_id: str
+    ):
+        """Execute fetch() inside browser page and stream SSE chunks via callback."""
+        js_code = """
+        async ([url, payloadJson, requestId]) => {
+            try {
+                const csrf = document.cookie.match(/passport_csrf_token=([^;]+)/);
+                const csrfToken = csrf ? csrf[1] : '';
+                const headers = {
+                    'Content-Type': 'application/json',
+                    'agw-js-conv': 'str',
+                };
+                if (csrfToken) {
+                    headers['x-tt-passport-csrf-token'] = csrfToken;
+                }
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: headers,
+                    body: payloadJson,
+                    credentials: 'include',
+                });
+                if (!res.ok) {
+                    const errBody = await res.text();
+                    await window.__doubaoStreamChunk(requestId,
+                        '__HTTP_ERROR__:' + res.status + ':' + errBody.slice(0, 500));
+                    return;
+                }
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let currentEvent = '';
+                let buffer = '';
+                while (true) {
+                    const {done, value} = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, {stream: true});
+                    const lines = buffer.split('\\n');
+                    buffer = lines.pop();
+                    for (const line of lines) {
+                        const trimmed = line.trim();
+                        if (!trimmed) continue;
+                        if (trimmed.startsWith('event: ')) {
+                            currentEvent = trimmed.slice(7);
+                            continue;
+                        }
+                        if (trimmed.startsWith('id: ')) continue;
+                        if (!trimmed.startsWith('data: ')) continue;
+                        const dataStr = trimmed.slice(6);
+                        if (!dataStr || dataStr === '{}') continue;
+                        try {
+                            const obj = JSON.parse(dataStr);
+                            obj._event = currentEvent;
+                            await window.__doubaoStreamChunk(requestId, JSON.stringify(obj));
+                        } catch(e) {}
+                    }
+                }
+                // Process remaining buffer
+                if (buffer.trim()) {
+                    const trimmed = buffer.trim();
+                    if (trimmed.startsWith('data: ')) {
+                        const dataStr = trimmed.slice(6);
+                        if (dataStr && dataStr !== '{}') {
+                            try {
+                                const obj = JSON.parse(dataStr);
+                                obj._event = currentEvent;
+                                await window.__doubaoStreamChunk(requestId, JSON.stringify(obj));
+                            } catch(e) {}
+                        }
+                    }
+                }
+                // Signal completion
+                await window.__doubaoStreamChunk(requestId, null);
+            } catch(e) {
+                await window.__doubaoStreamChunk(requestId, '__ERROR__:' + e.message);
+            }
+        }
+        """
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        await self._page.evaluate(js_code, [url, payload_json, request_id])
 
     # ------------------------------------------------------------------
     # High-level chat helper
@@ -635,29 +777,64 @@ class BrowserClient:
         payload: Dict[str, Any],
         timeout: float = 120,
     ) -> str:
-        """Send a request to /samantha/chat/completion and return raw body."""
+        """Send a request to /samantha/chat/completion via in-browser fetch."""
         if not self._ready:
             raise RuntimeError("Browser not ready - need login first")
 
         query_params = self._build_query_params()
-        signed_url = await self._sign_url(SAMANTHA_COMPLETION_URL, query_params)
-        cookie_str = await self._get_cookies_string()
-        headers = self._build_headers(cookie_str)
+        query_string = "&".join(f"{k}={v}" for k, v in sorted(query_params.items()))
+        url = f"/samantha/chat/completion?{query_string}"
 
-        resp = await self._http.post(
-            signed_url, headers=headers, json=payload, timeout=timeout,
+        js_code = """
+        async ([url, payloadJson, timeoutMs]) => {
+            const csrf = document.cookie.match(/passport_csrf_token=([^;]+)/);
+            const csrfToken = csrf ? csrf[1] : '';
+            const headers = {
+                'Content-Type': 'application/json',
+                'agw-js-conv': 'str',
+            };
+            if (csrfToken) {
+                headers['x-tt-passport-csrf-token'] = csrfToken;
+            }
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: headers,
+                    body: payloadJson,
+                    credentials: 'include',
+                    signal: controller.signal,
+                });
+                clearTimeout(timer);
+                if (!res.ok) {
+                    const errBody = await res.text();
+                    return {error: true, status: res.status, body: errBody.slice(0, 500)};
+                }
+                const body = await res.text();
+                return {error: false, body: body};
+            } catch(e) {
+                clearTimeout(timer);
+                return {error: true, status: 0, body: e.message};
+            }
+        }
+        """
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        timeout_ms = int(timeout * 1000)
+
+        log.info("POST %s [browser fetch, timeout=%ds]", url.split("?")[0], timeout)
+        result = await self._page.evaluate(
+            js_code, [url, payload_json, timeout_ms]
         )
-        # Rotate msToken
-        new_ms = resp.headers.get("x-ms-token", "")
-        if new_ms:
-            self._ms_token = new_ms
-        if resp.status_code != 200:
+
+        if result.get("error"):
+            status = result.get("status", 0)
+            body = result.get("body", "")
             raise RuntimeError(
-                f"samantha/chat/completion failed ({resp.status_code}): "
-                f"{resp.text[:500]}"
+                f"samantha/chat/completion failed ({status}): {body[:500]}"
             )
 
-        body = resp.text
+        body = result.get("body", "")
         if body.lstrip().startswith("{"):
             try:
                 err = json.loads(body)
@@ -1083,21 +1260,11 @@ class BrowserClient:
         import base64
 
         poll_payload = {"task_id": task_id, "event_id": 0}
-        query_params = self._build_query_params()
-        signed_url = await self._sign_url(SAMANTHA_COMPLETION_URL, query_params)
-        cookie_str = await self._get_cookies_string()
-        headers = self._build_headers(cookie_str)
-
-        resp = await self._http.post(
-            signed_url, headers=headers, json=poll_payload, timeout=timeout,
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"Video poll failed ({resp.status_code}): {resp.text[:500]}"
-            )
+        # Use _samantha_request which now uses browser fetch
+        raw = await self._samantha_request(poll_payload, timeout=timeout)
 
         videos = []
-        for data in self._parse_samantha_sse(resp.text):
+        for data in self._parse_samantha_sse(raw):
             et = data.get("event_type")
             if et != 2001:
                 continue
@@ -1522,44 +1689,60 @@ class BrowserClient:
         }
 
         query_params = self._build_query_params()
-        signed_url = await self._sign_url(COMPLETION_URL, query_params)
-        cookie_str = await self._get_cookies_string()
-        headers = self._build_headers(cookie_str)
+        query_string = "&".join(f"{k}={v}" for k, v in sorted(query_params.items()))
+        url = f"/chat/completion?{query_string}"
+
+        # Use browser fetch (non-streaming, collect full response)
+        js_code = """
+        async ([url, payloadJson]) => {
+            const csrf = document.cookie.match(/passport_csrf_token=([^;]+)/);
+            const csrfToken = csrf ? csrf[1] : '';
+            const headers = {
+                'Content-Type': 'application/json',
+                'agw-js-conv': 'str',
+            };
+            if (csrfToken) headers['x-tt-passport-csrf-token'] = csrfToken;
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: headers,
+                body: payloadJson,
+                credentials: 'include',
+            });
+            if (!res.ok) {
+                const errBody = await res.text();
+                return {error: true, status: res.status, body: errBody.slice(0, 500)};
+            }
+            const body = await res.text();
+            return {error: false, body: body};
+        }
+        """
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        log.info("POST /chat/completion [chat_with_file, browser fetch]")
+        result = await self._page.evaluate(js_code, [url, payload_json])
+
+        if result.get("error"):
+            raise RuntimeError(
+                f"chat_with_file error {result.get('status')}: {result.get('body', '')[:200]}"
+            )
 
         full_text = ""
         conv_id = None
-        async with self._http.stream("POST", signed_url, headers=headers, json=payload) as response:
-            # Rotate msToken
-            new_ms = response.headers.get("x-ms-token", "")
-            if new_ms:
-                self._ms_token = new_ms
-            if response.status_code != 200:
-                body = await response.aread()
-                raise RuntimeError(f"chat_with_file error {response.status_code}: {body.decode()[:200]}")
-            current_event = ""
-            async for line in response.aiter_lines():
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("event: "):
-                    current_event = line[7:]
-                    continue
-                if line.startswith("id: "):
-                    continue
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:]
-                if not data_str or data_str == "{}":
-                    continue
-                try:
-                    data = json.loads(data_str)
-                    data["_event"] = current_event
-                    full_text += self._extract_text(data)
-                    if not conv_id:
-                        cid = self.extract_conversation_id(data)
-                        if cid and cid != "0":
-                            conv_id = cid
-                except json.JSONDecodeError:
-                    continue
+        raw_body = result.get("body", "")
+        for block in raw_body.split("\n"):
+            line = block.strip()
+            if not line or not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if not data_str or data_str == "{}":
+                continue
+            try:
+                data = json.loads(data_str)
+                full_text += self._extract_text(data)
+                if not conv_id:
+                    cid = self.extract_conversation_id(data)
+                    if cid and cid != "0":
+                        conv_id = cid
+            except json.JSONDecodeError:
+                continue
 
         return {"text": full_text, "conversation_id": conv_id}
