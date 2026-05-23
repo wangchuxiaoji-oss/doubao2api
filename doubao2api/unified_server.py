@@ -112,6 +112,8 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
+    conversation_id: Optional[str] = None
+    bot_id: Optional[str] = None
 
 
 
@@ -121,6 +123,7 @@ class ImageGenerationRequest(BaseModel):
     n: int = 1
     size: Optional[str] = "1024x1024"
     ratio: Optional[str] = None
+    ref_image_key: Optional[str] = None
     response_format: Optional[str] = "url"
 
 # ── Application factory ──────────────────────────────────────
@@ -406,7 +409,8 @@ def create_app(
                     detail="file_url attachments are currently supported for non-streaming requests only",
                 )
             return StreamingResponse(
-                _stream_chat(client, prompt, use_deep_think, request_id, body.model),
+                _stream_chat(client, prompt, use_deep_think, request_id, body.model,
+                             conversation_id=body.conversation_id, bot_id=body.bot_id),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -426,12 +430,13 @@ def create_app(
                 message = {"role": "assistant", "content": result["text"]}
             else:
                 message = await _collect_chat_response(
-                    client, prompt, use_deep_think
+                    client, prompt, use_deep_think,
+                    conversation_id=body.conversation_id, bot_id=body.bot_id,
                 )
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
 
-        return JSONResponse({
+        resp_data = {
             "id": request_id,
             "object": "chat.completion",
             "created": int(time.time()),
@@ -442,7 +447,10 @@ def create_app(
                 "finish_reason": "stop",
             }],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        })
+        }
+        if message.get("conversation_id"):
+            resp_data["conversation_id"] = message["conversation_id"]
+        return JSONResponse(resp_data)
 
     @app.post("/v1/images/generations")
     async def image_generations(body: ImageGenerationRequest, request: Request):
@@ -454,7 +462,9 @@ def create_app(
 
         try:
             result = await client.generate_image(
-                prompt=body.prompt, ratio=ratio,
+                prompt=body.prompt,
+                ratio=ratio,
+                ref_image_key=body.ref_image_key,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
@@ -658,6 +668,9 @@ def create_app(
         client: BrowserClient,
         prompt: str,
         use_deep_think: int,
+        *,
+        conversation_id: Optional[str] = None,
+        bot_id: Optional[str] = None,
     ) -> dict:
         """Collect full chat response with thinking separation.
 
@@ -669,6 +682,7 @@ def create_app(
         in_thinking = False
         thinking_parts: list = []
         content_parts: list = []
+        result_conversation_id: Optional[str] = None
 
         def _iter_blocks(data: dict):
             for patch in data.get("patch_op", []):
@@ -679,7 +693,9 @@ def create_app(
                 yield from dc.get("content_block", [])
 
         async for event in client.chat_completion(
-            prompt, use_deep_think=use_deep_think
+            prompt, use_deep_think=use_deep_think,
+            conversation_id=conversation_id or None,
+            bot_id=bot_id or None,
         ):
             if event.get("error"):
                 raise RuntimeError(
@@ -691,6 +707,12 @@ def create_app(
                 msg = event.get("error_msg", "")
                 client.record_failure(code)
                 raise RuntimeError(f"Error code={code}: {msg}")
+
+            # Extract conversation_id for multi-turn
+            if not result_conversation_id:
+                cid = client.extract_conversation_id(event)
+                if cid and cid != "0":
+                    result_conversation_id = cid
 
             event_type = event.get("_event", "")
 
@@ -746,8 +768,10 @@ def create_app(
         message: dict = {"role": "assistant", "content": "".join(content_parts)}
         if thinking_parts:
             message["reasoning_content"] = "".join(thinking_parts)
-        return message
+        if result_conversation_id:
+            message["conversation_id"] = result_conversation_id
         client.record_success()
+        return message
 
     async def _stream_chat(
         client: BrowserClient,
@@ -755,6 +779,9 @@ def create_app(
         use_deep_think: int,
         request_id: str,
         model: str,
+        *,
+        conversation_id: Optional[str] = None,
+        bot_id: Optional[str] = None,
     ):
         """Generate real-time SSE stream in OpenAI format via httpx streaming.
 
@@ -769,6 +796,7 @@ def create_app(
         in_thinking = False
         # Track last emitted result count per block_id for incremental updates
         search_last_count: dict = {}
+        result_conversation_id: Optional[str] = None
 
         def _make_chunk(delta: dict, finish_reason=None):
             return {
@@ -794,7 +822,9 @@ def create_app(
 
         try:
             async for event in client.chat_completion(
-                prompt, use_deep_think=use_deep_think
+                prompt, use_deep_think=use_deep_think,
+                conversation_id=conversation_id or None,
+                bot_id=bot_id or None,
             ):
                 if event.get("error"):
                     chunk = _make_chunk(
@@ -805,6 +835,12 @@ def create_app(
                     return
 
                 event_type = event.get("_event", "")
+
+                # --- Extract conversation_id for multi-turn ---
+                if not result_conversation_id:
+                    cid = client.extract_conversation_id(event)
+                    if cid and cid != "0":
+                        result_conversation_id = cid
 
                 # --- error_code handling (risk control, session expired) ---
                 if event_type == "STREAM_ERROR" or event.get("error_code"):
@@ -915,7 +951,10 @@ def create_app(
 
         # Final chunk
         client.record_success()
-        yield f"data: {json.dumps(_make_chunk({}, 'stop'))}\n\n"
+        final_delta: dict = {}
+        if result_conversation_id:
+            final_delta["conversation_id"] = result_conversation_id
+        yield f"data: {json.dumps(_make_chunk(final_delta, 'stop'))}\n\n"
         yield "data: [DONE]\n\n"
 
     # ── Admin Dashboard & Auth ──
