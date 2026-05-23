@@ -58,8 +58,8 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:#6366f1;box-sh
 </nav>
 <div class="p-4 border-t border-slate-800 text-xs text-slate-500">
 <div class="flex items-center gap-2">
-<span :class="['w-2 h-2 rounded-full',session&&session.status==='healthy'?'bg-green-400':'bg-red-400']"></span>
-{{session?session.status:'offline'}}</div>
+<span :class="['w-2 h-2 rounded-full',session&&session.logged_in?'bg-green-400':'bg-red-400']"></span>
+{{session&&session.logged_in?'已登录':'未登录'}}</div>
 </div></aside>
 <!-- Main content -->
 <div class="flex-1 overflow-y-auto">
@@ -73,8 +73,8 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:#6366f1;box-sh
 <!-- Status cards -->
 <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
 <div class="metric card card-glow"><div class="text-xs text-slate-400 mb-1">Session 状态</div>
-<div class="flex items-center gap-2"><span :class="['w-2.5 h-2.5 rounded-full',session&&session.status==='healthy'?'bg-green-400 pulse':'bg-red-400']"></span>
-<span class="text-lg font-semibold" :class="session&&session.status==='healthy'?'text-green-400':'text-red-400'">{{session?session.status:'--'}}</span></div></div>
+<div class="flex items-center gap-2"><span :class="['w-2.5 h-2.5 rounded-full',session&&session.logged_in?'bg-green-400 pulse':'bg-red-400']"></span>
+<span class="text-lg font-semibold" :class="session&&session.logged_in?'text-green-400':'text-red-400'">{{session&&session.logged_in?'已登录':'未登录'}}</span></div></div>
 <div class="metric card"><div class="text-xs text-slate-400 mb-1">运行时长</div>
 <div class="text-lg font-semibold text-brand-400">{{fmtDur(session?session.age_seconds:0)}}</div></div>
 <div class="metric card"><div class="text-xs text-slate-400 mb-1">RPM Limit</div>
@@ -142,7 +142,24 @@ class="px-2.5 py-1 bg-brand-900/40 text-brand-300 text-xs rounded-full border bo
 <img :src="'data:image/png;base64,'+qr.img" class="w-44 h-44"/></div>
 <p class="text-sm" :class="qrColor">{{qr.text}}</p>
 <button v-if="qr.st==='expired'||qr.st==='error'" @click="startQr" class="btn mt-4">重新生成</button>
-</div></div></section>
+</div></div>
+<div class="card mt-4 max-w-2xl mx-auto">
+<details id="vnc-details">
+<summary class="cursor-pointer text-slate-400 text-sm hover:text-slate-200">遇到风控？使用 VNC 手动登录</summary>
+<div class="mt-3">
+<p class="text-xs text-slate-500 mb-2">如果二维码反复过期或触发验证码，请通过 noVNC 手动操作浏览器。</p>
+<button @click="loadVnc" class="btn-sm mb-2">加载 noVNC</button>
+<div id="vnc-container"></div>
+</div></details></div>
+<div class="card mt-4 max-w-2xl mx-auto">
+<div class="flex items-center justify-between mb-2">
+<span class="text-sm text-slate-300">浏览器截图</span>
+<button @click="takeScreenshot" class="btn-sm">{{screenshot.loading?'截图中...':'截图'}}</button></div>
+<div v-if="screenshot.img" class="mt-2">
+<img :src="screenshot.img" class="w-full rounded-lg border border-slate-700" />
+<p class="text-xs text-slate-500 mt-1">{{screenshot.time}}</p></div>
+<div v-else class="text-xs text-slate-500 text-center py-4">点击截图查看浏览器当前画面</div>
+</div></section>
 <!-- TAB 2: API 测试 -->
 <section v-show="activeTab===2">
 <div class="card">
@@ -204,6 +221,7 @@ class="px-2.5 py-1 bg-brand-900/40 text-brand-300 text-xs rounded-full border bo
 </tbody></table></div></div></section>
 </div></div></div>
 <script>
+const NOVNC_URL="{{NOVNC_URL}}";
 const{createApp,ref,reactive,computed,onMounted}=Vue;
 createApp({setup(){
 const API=window.location.origin;
@@ -223,15 +241,16 @@ const probe=reactive({loading:false,result:'',ms:0,time:''});
 const qr=reactive({img:'',st:'',text:'等待生成'});
 const test=reactive({model:'doubao-think',stream:true,prompt:'',output:'',thinking:'',thinkOpen:true,error:'',loading:false,ms:0,searchResults:null});
 const logs=ref([]);
+const screenshot=reactive({img:"",loading:false,time:""});
 const currentTime=ref('');
 const allModels=['doubao','doubao-quick','doubao-think','doubao-auto','doubao-expert','doubao-pro','doubao-image','doubao-video','doubao-music'];
 const qrColor=computed(()=>({'text-green-400':qr.st==='success'||qr.st==='confirmed','text-yellow-400':qr.st==='scanned','text-slate-400':qr.st==='waiting_scan','text-red-400':qr.st==='expired'||qr.st==='failed'}));
 function fmtDur(s){if(!s&&s!==0)return'N/A';s=Math.round(s);if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+s%60+'s';const h=Math.floor(s/3600);return h+'h '+Math.floor((s%3600)/60)+'m'}
 function fmtTime(ts){if(!ts)return'';return new Date(ts*1000).toLocaleTimeString('zh-CN',{hour12:false})}
 async function api(path,opts={}){const r=await fetch(API+path,{headers,...opts});return r.json()}
-async function fetchSession(){try{session.value=await api('/v1/session/status')}catch(e){session.value={status:'error'}}}
+async function fetchSession(){try{const d=await api('/admin/api/status');session.value={status:d.logged_in?'healthy':'not_logged_in',logged_in:d.logged_in}}catch(e){session.value={status:'error',logged_in:false}}}
 async function probeSession(){probe.loading=true;probe.result='';const t0=Date.now();
-try{const r=await api('/v1/session/status?probe=true');probe.result=r.status||'error';probe.ms=Date.now()-t0;
+try{const r=await api('/admin/api/probe',{method:'POST'});probe.result=r.status||'error';probe.ms=Date.now()-t0;
 probe.time=new Date().toLocaleTimeString('zh-CN',{hour12:false});session.value=r}
 catch(e){probe.result='error';probe.ms=Date.now()-t0;probe.time=new Date().toLocaleTimeString('zh-CN',{hour12:false})}
 finally{probe.loading=false}}
@@ -254,6 +273,8 @@ function qrLoginSuccess(){qr.text='登录成功! 3秒后跳转到概览页...';
 setTimeout(()=>{qr.text='登录成功! 2秒后跳转...';
 setTimeout(()=>{qr.text='登录成功! 1秒后跳转...';
 setTimeout(()=>{activeTab.value=0;qr.img='';qr.st='';qr.text='';fetchOverview()},1000)},1000)},1000)}
+function loadVnc(){document.getElementById('vnc-container').innerHTML='<iframe src="'+NOVNC_URL+'" style="width:100%;height:480px;border:1px solid #334155;border-radius:8px;margin-top:8px" allowfullscreen allow="fullscreen"></iframe>'}
+async function takeScreenshot(){screenshot.loading=true;try{const r=await fetch(API+'/auth/screenshot',{headers});if(!r.ok)throw new Error('HTTP '+r.status);const blob=await r.blob();screenshot.img=URL.createObjectURL(blob);screenshot.time=new Date().toLocaleTimeString('zh-CN',{hour12:false})}catch(e){screenshot.img='';alert('截图失败: '+e.message)}finally{screenshot.loading=false}}
 async function runTest(){
 test.output='';test.thinking='';test.error='';test.loading=true;test.ms=0;test.searchResults=null;const t0=Date.now();
 try{
@@ -261,7 +282,7 @@ if(test.model.startsWith('doubao-image')){
 const r=await api('/v1/images/generations',{method:'POST',body:JSON.stringify({prompt:test.prompt,model:test.model})});
 test.output=JSON.stringify(r,null,2);test.ms=Date.now()-t0;
 }else if(test.model==='doubao-video'){
-const r=await api('/v1/videos/generations',{method:'POST',body:JSON.stringify({prompt:test.prompt,model:test.model})});
+const r=await api('/v1/video/generations',{method:'POST',body:JSON.stringify({prompt:test.prompt,model:test.model})});
 test.output=JSON.stringify(r,null,2);test.ms=Date.now()-t0;
 }else if(test.model==='doubao-music'){
 const r=await api('/v1/audio/generations',{method:'POST',body:JSON.stringify({prompt:test.prompt,model:test.model})});
@@ -286,8 +307,8 @@ setInterval(()=>{currentTime.value=new Date().toLocaleTimeString('zh-CN',{hour12
 onMounted(()=>{fetchOverview();fetchLogs();currentTime.value=new Date().toLocaleTimeString('zh-CN',{hour12:false});
 setInterval(()=>{if(activeTab.value===0)fetchSession()},10000);
 setInterval(()=>{if(activeTab.value===3)fetchLogs()},5000)});
-return{tabs,icons,activeTab,session,sysInfo,cookieData,probe,qr,qrColor,test,logs,allModels,currentTime,
-fmtDur,fmtTime,fetchOverview,probeSession,fetchLogs,startQr,runTest}}}).mount('#app');
+return{tabs,icons,activeTab,session,sysInfo,cookieData,probe,qr,qrColor,test,logs,allModels,currentTime,screenshot,
+fmtDur,fmtTime,fetchOverview,probeSession,fetchLogs,startQr,loadVnc,takeScreenshot,runTest}}}).mount('#app');
 </script>
 </body>
 </html>
