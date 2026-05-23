@@ -953,7 +953,14 @@ def create_app(
                                     tool_buffer = ""
                                     tool_mode = False
                                     emitted_tool_calls = True
-                                # else: keep buffering
+                                else:
+                                    # XML complete but parse failed — flush as content
+                                    log.warning("Tool call XML parse failed, flushing as content")
+                                    delta = {"role": "assistant", "content": tool_buffer}
+                                    chunk = _make_chunk(delta)
+                                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                                    tool_buffer = ""
+                                    tool_mode = False
                             continue  # don't emit raw text while in tool mode
                         else:
                             # Not a tool call start — flush buffer as normal content
@@ -1048,6 +1055,13 @@ def create_app(
                                             tool_buffer = ""
                                             tool_mode = False
                                             emitted_tool_calls = True
+                                        else:
+                                            # XML complete but parse failed
+                                            delta = {"role": "assistant", "content": tool_buffer}
+                                            chunk = _make_chunk(delta)
+                                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                                            tool_buffer = ""
+                                            tool_mode = False
                                 elif len(tool_buffer) > 20 and not is_tool_call_start(tool_buffer):
                                     delta = {"role": "assistant", "content": tool_buffer}
                                     chunk = _make_chunk(delta)
@@ -1105,6 +1119,11 @@ def create_app(
                         chunk = _make_chunk(delta_args)
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                     emitted_tool_calls = True
+                else:
+                    # Parse failed — flush as content
+                    delta = {"role": "assistant", "content": tool_buffer}
+                    chunk = _make_chunk(delta)
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             elif tool_buffer.strip():
                 # Emit as regular content
                 delta = {"role": "assistant", "content": tool_buffer}
