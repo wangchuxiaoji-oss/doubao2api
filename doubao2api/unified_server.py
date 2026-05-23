@@ -844,6 +844,7 @@ def create_app(
         # Tool calling state
         tool_buffer = ""  # accumulates text when tool call detected
         tool_mode = False  # True when we're buffering potential tool call XML
+        emitted_tool_calls = False  # True once we've emitted tool_calls chunks
 
         def _make_chunk(delta: dict, finish_reason=None):
             return {
@@ -951,6 +952,7 @@ def create_app(
                                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                                     tool_buffer = ""
                                     tool_mode = False
+                                    emitted_tool_calls = True
                                 # else: keep buffering
                             continue  # don't emit raw text while in tool mode
                         else:
@@ -1045,6 +1047,7 @@ def create_app(
                                                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                                             tool_buffer = ""
                                             tool_mode = False
+                                            emitted_tool_calls = True
                                 elif len(tool_buffer) > 20 and not is_tool_call_start(tool_buffer):
                                     delta = {"role": "assistant", "content": tool_buffer}
                                     chunk = _make_chunk(delta)
@@ -1101,6 +1104,7 @@ def create_app(
                             "function": {"arguments": tc["function"]["arguments"]}}]}
                         chunk = _make_chunk(delta_args)
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    emitted_tool_calls = True
             elif tool_buffer.strip():
                 # Emit as regular content
                 delta = {"role": "assistant", "content": tool_buffer}
@@ -1112,7 +1116,7 @@ def create_app(
         final_delta: dict = {}
         if result_conversation_id:
             final_delta["conversation_id"] = result_conversation_id
-        yield f"data: {json.dumps(_make_chunk(final_delta, 'stop'))}\n\n"
+        yield f"data: {json.dumps(_make_chunk(final_delta, 'tool_calls' if emitted_tool_calls else 'stop'))}\n\n"
         yield "data: [DONE]\n\n"
 
     # ── Admin Dashboard & Auth ──
