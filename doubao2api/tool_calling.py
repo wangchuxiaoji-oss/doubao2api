@@ -288,16 +288,34 @@ def has_complete_tool_calls(text: str) -> bool:
 
 # ── Message conversion for multi-turn tool use ──
 
+# Max chars for the flattened prompt (~28K tokens safe zone for Qwen web)
+MAX_PROMPT_CHARS = 50000
+# Max chars per individual tool result
+MAX_TOOL_RESULT_CHARS = 8000
+
+
+def _truncate_tool_result(content: str, max_chars: int = MAX_TOOL_RESULT_CHARS) -> str:
+    """Truncate a tool result, keeping head and tail for context."""
+    if not content or len(content) <= max_chars:
+        return content
+    half = max_chars // 2 - 50
+    return (content[:half] +
+            f"\n\n... [truncated {len(content) - max_chars} chars] ...\n\n" +
+            content[-half:])
+
+
 def convert_messages_with_tools(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
+    max_chars: int = MAX_PROMPT_CHARS,
 ) -> str:
     """Convert OpenAI-format messages (including role:tool) to plain text prompt.
     
     Handles:
     - Injects tool system prompt
-    - Converts role:assistant with tool_calls to XML format
+    - Converts role:assistant with tool_calls to official format
     - Converts role:tool results to readable text
+    - Smart truncation to stay within token limits
     """
     tool_system = build_tool_system_prompt(tools)
     parts = []
@@ -307,20 +325,18 @@ def convert_messages_with_tools(
         content = msg.get("content", "")
         
         if role == "system":
-            # Prepend user's system prompt, then our tool prompt
             if content:
                 parts.append(f"[system]: {content}\n\n{tool_system}")
             continue
         
         elif role == "tool":
-            # Convert tool result to readable format
             name = msg.get("name", "unknown_tool")
+            tool_content = _truncate_tool_result(content or "")
             parts.append(TOOL_RESULT_TEMPLATE.format(
-                name=name, content=content or ""
+                name=name, content=tool_content
             ))
         
         elif role == "assistant":
-            # If assistant message has tool_calls, reconstruct XML
             tool_calls = msg.get("tool_calls")
             if tool_calls:
                 xml = _reconstruct_tool_calls_xml(tool_calls)
@@ -332,7 +348,6 @@ def convert_messages_with_tools(
             if isinstance(content, str):
                 parts.append(f"[user]: {content}")
             elif isinstance(content, list):
-                # Handle multimodal content
                 text_parts = [p.get("text", "") for p in content 
                              if isinstance(p, dict) and p.get("type") == "text"]
                 if text_parts:
@@ -342,7 +357,47 @@ def convert_messages_with_tools(
     if not any(m.get("role") == "system" for m in messages):
         parts.insert(0, f"[system]: {tool_system}")
     
-    return "\n\n".join(parts)
+    result = "\n\n".join(parts)
+    
+    # If still over limit after per-result truncation, drop oldest tool rounds
+    if len(result) > max_chars:
+        result = _drop_old_rounds(parts, max_chars)
+    
+    return result
+
+
+def _drop_old_rounds(parts: list[str], max_chars: int) -> str:
+    """Drop oldest tool call/result pairs until under the limit.
+    
+    Strategy: keep first part (system) and last few parts (recent context),
+    drop middle parts (old tool results) with a summary marker.
+    """
+    if not parts:
+        return ""
+    
+    # Always keep: first part (system+tools) and last part
+    # Drop from position 1 onwards until we fit
+    header = parts[0]  # system prompt
+    
+    # Find how many parts we can keep from the end
+    budget = max_chars - len(header) - 200  # reserve for join separators + marker
+    kept_tail = []
+    tail_size = 0
+    
+    for part in reversed(parts[1:]):
+        part_size = len(part) + 4  # +4 for "\n\n" separator
+        if tail_size + part_size <= budget:
+            kept_tail.insert(0, part)
+            tail_size += part_size
+        else:
+            break
+    
+    dropped_count = len(parts) - 1 - len(kept_tail)
+    if dropped_count > 0:
+        marker = f"[... {dropped_count} earlier messages truncated to fit context limit ...]"
+        return "\n\n".join([header, marker] + kept_tail)
+    else:
+        return "\n\n".join([header] + kept_tail)
 
 
 def _reconstruct_tool_calls_xml(tool_calls: list[dict[str, Any]]) -> str:
