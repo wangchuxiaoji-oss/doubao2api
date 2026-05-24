@@ -127,13 +127,13 @@ class QianwenClient:
         await stealth.apply_stealth_async(self._page)
 
         # Navigate to Qianwen
-        await self._page.goto(CHAT_URL, wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(2)
+        await self._page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(3)
 
         # Wait for security SDK to load
         await self._page.wait_for_function(
             "() => window.__QIANWEN_CHAT_SDK__ && window.etSign && window.__baxia__",
-            timeout=15000,
+            timeout=30000,
         )
         log.info("Qianwen security SDK loaded")
 
