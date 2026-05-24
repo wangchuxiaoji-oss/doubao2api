@@ -357,7 +357,9 @@ class QianwenClient:
                 # Parse JSON
                 try:
                     data = json.loads(chunk)
-                    yield data
+                    if isinstance(data, dict):
+                        yield data
+                    # Skip non-dict values (e.g., bare "true" from event:complete)
                 except json.JSONDecodeError:
                     continue
         except asyncio.TimeoutError:
