@@ -719,7 +719,9 @@ def create_app(
                 if not parsed and detect_truncated_tool_call(source or content):
                     log.info("Detected truncated tool_call, attempting continuation...")
                     cont_prompt = build_continuation_prompt(source or content)
-                    cont_messages = messages_for_qw + "\n\n" + cont_prompt if isinstance(messages_for_qw, str) else cont_prompt
+                    # messages_for_qw is [{"role": "user", "content": prompt}]
+                    # For continuation, send as a new single-message request
+                    cont_messages = [{"role": "user", "content": cont_prompt}]
                     try:
                         cont_result = await qw_client.chat(cont_messages, qw_model, deep_search)
                         cont_content = cont_result["content"]
@@ -905,7 +907,8 @@ def create_app(
                 log.info("Stream: detected truncated tool_call, attempting continuation...")
                 cont_prompt = build_continuation_prompt(source or full_content)
                 try:
-                    cont_result = await qw_client.chat(cont_prompt, model, deep_search)
+                    cont_messages = [{"role": "user", "content": cont_prompt}]
+                    cont_result = await qw_client.chat(cont_messages, model, deep_search)
                     cont_content = cont_result.get("content", "")
                     combined = (source or full_content) + cont_content
                     parsed = parse_tool_calls_xml(combined)

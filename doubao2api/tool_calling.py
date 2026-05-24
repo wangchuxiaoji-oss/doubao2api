@@ -650,12 +650,21 @@ def build_continuation_prompt(original_output: str, max_anchor: int = 2000) -> s
 def _extract_tokens(text: str) -> set:
     """Extract meaningful tokens from text for similarity comparison.
     
-    Splits on whitespace and punctuation, lowercases, filters short tokens.
+    Handles both Latin (word-based) and CJK (character bigram) text.
     """
-    # Split on non-alphanumeric (works for both CJK and Latin)
-    tokens = re.split(r'[\s\W_]+', text.lower())
-    # Keep tokens with length >= 2 (filters noise)
-    return {t for t in tokens if len(t) >= 2}
+    tokens = set()
+    # Split on whitespace/punctuation for Latin words
+    words = re.split(r'[\s\W_]+', text.lower())
+    tokens.update(t for t in words if len(t) >= 2)
+    
+    # For CJK: extract character bigrams (2-char sliding window)
+    # CJK Unified Ideographs range: \u4e00-\u9fff
+    cjk_chars = re.findall(r'[\u4e00-\u9fff]', text)
+    if len(cjk_chars) >= 2:
+        for i in range(len(cjk_chars) - 1):
+            tokens.add(cjk_chars[i] + cjk_chars[i + 1])
+    
+    return tokens
 
 
 def _jaccard_similarity(set_a: set, set_b: set) -> float:
@@ -677,11 +686,11 @@ def detect_topic_change(prev_user_msg: str, new_user_msg: str) -> bool:
     Uses Jaccard similarity on token sets. Returns True if the messages
     are dissimilar enough to warrant discarding old history.
     
-    Only triggers on substantial messages (>20 chars) to avoid false positives
+    Only triggers on substantial messages (>10 chars) to avoid false positives
     on short follow-ups like "yes", "continue", "fix it".
     """
     # Short messages are likely follow-ups, not new topics
-    if len(new_user_msg) < 20 or len(prev_user_msg) < 20:
+    if len(new_user_msg) < 10 or len(prev_user_msg) < 10:
         return False
     
     tokens_prev = _extract_tokens(prev_user_msg)
