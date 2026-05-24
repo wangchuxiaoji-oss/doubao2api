@@ -190,6 +190,8 @@ class ChatCompletionRequest(BaseModel):
     bot_id: Optional[str] = None
     tools: Optional[List[dict]] = None
     tool_choice: Optional[Any] = None  # "auto" | "none" | {"type":"function","function":{"name":"..."}}
+    enable_thinking: Optional[bool] = None  # triggers deep_search="1" for thinking mode
+    reasoning_effort: Optional[str] = None  # "low"|"medium"|"high" — also triggers thinking
 
 
 
@@ -635,6 +637,11 @@ def create_app(
         model_config = QIANWEN_MODELS.get(body.model, {"model": "Qwen", "deep_search": "0"})
         qw_model = model_config["model"]
         deep_search = model_config["deep_search"]
+        # Support enable_thinking parameter (like official API)
+        if body.enable_thinking or (body.reasoning_effort and body.reasoning_effort != "none"):
+            deep_search = "1"
+        # NOTE: tools + thinking mode IS supported — tool output appears in think_content
+        # Do NOT force deep_search="0" when tools are present
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
         messages_raw = [m.model_dump(exclude_none=True) for m in body.messages]
@@ -664,12 +671,22 @@ def create_app(
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
 
+            import re as _re
+            _think_prefix_re = _re.compile(r"^\[?\(multimodal_chat_think_\d+\)\]?\s*")
+
             content = result["content"]
+            think_content = result.get("think_content", "")
             usage = result.get("usage", {})
 
-            # Check for tool calls in response
-            if has_tools and is_tool_call_start(content.strip()):
-                parsed = parse_tool_calls_xml(content)
+            # Strip thinking prefix from content
+            content = _think_prefix_re.sub("", content).strip()
+
+            # Check for tool calls in think_content first, then content
+            if has_tools:
+                source = think_content if think_content else content
+                parsed = parse_tool_calls_xml(source)
+                if not parsed and content:
+                    parsed = parse_tool_calls_xml(content)
                 if parsed:
                     return JSONResponse({
                         "id": request_id,
@@ -692,6 +709,11 @@ def create_app(
                         },
                     })
 
+            # Build message with optional reasoning_content
+            message: Dict[str, Any] = {"role": "assistant", "content": content}
+            if think_content and deep_search == "1":
+                message["reasoning_content"] = think_content
+
             return JSONResponse({
                 "id": request_id,
                 "object": "chat.completion",
@@ -699,7 +721,7 @@ def create_app(
                 "model": result.get("model", body.model),
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": content},
+                    "message": message,
                     "finish_reason": "stop",
                 }],
                 "usage": {
@@ -721,14 +743,19 @@ def create_app(
     ):
         """Generate OpenAI-compatible SSE stream from Qianwen's cumulative format.
 
-        Tool calling logic:
-        - Qianwen content is cumulative, so we check the full content for <tool_calls>
-        - Once detected, stop emitting content deltas and buffer until complete
-        - On completion, parse XML and emit as tool_calls chunks
+        Handles:
+        - Normal content streaming (delta computation from cumulative)
+        - Thinking mode: emits reasoning_content deltas from think_content
+        - Tool calling: detects <tool_call> in content OR think_content
         """
-        prev_content = ""  # Track previous content for delta calculation
-        tool_mode = False  # True once <tool_calls> detected in cumulative content
-        tool_content_start = 0  # Position where tool_calls XML starts
+        import re as _re
+
+        prev_content = ""
+        prev_think = ""
+        tool_mode = False
+        is_thinking = (deep_search == "1")
+        # Regex to strip [(multimodal_chat_think_N)] prefix
+        _think_prefix_re = _re.compile(r"^\[?\(multimodal_chat_think_\d+\)\]?\s*")
 
         def _make_chunk(delta: dict, finish_reason=None):
             return {
@@ -747,7 +774,8 @@ def create_app(
         chunk = _make_chunk({"role": "assistant", "content": ""})
         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
-        full_content = ""  # Cumulative content for tool detection
+        full_content = ""
+        full_think = ""
 
         try:
             async for event in qw_client.chat_stream(messages, model, deep_search):
@@ -761,39 +789,70 @@ def create_app(
                 data = event.get("data", {})
                 msgs = data.get("messages", [])
                 for msg in msgs:
-                    if msg.get("mime_type") == "multi_load/iframe" and msg.get("content"):
-                        current = msg["content"]
-                        full_content = current
+                    if msg.get("mime_type") != "multi_load/iframe":
+                        continue
+                    current = msg.get("content", "")
+                    if not current:
+                        continue
 
-                        if tool_mode:
-                            # Already in tool mode, just keep buffering
+                    # Extract think_content from meta_data if present
+                    think_content = ""
+                    meta = msg.get("meta_data", {})
+                    multi_load = meta.get("multi_load", [])
+                    if multi_load and isinstance(multi_load, list):
+                        ml_content = multi_load[0].get("content", {})
+                        if isinstance(ml_content, dict):
+                            think_content = ml_content.get("think_content", "")
+
+                    # Strip thinking prefix from main content
+                    clean_content = _think_prefix_re.sub("", current).strip()
+                    full_content = clean_content
+
+                    if tool_mode:
+                        # Buffering for tool call completion
+                        full_think = think_content
+                        continue
+
+                    # Check for tool calls in think_content or main content
+                    if has_tools:
+                        check_text = think_content or clean_content
+                        if is_tool_call_start(check_text.strip()):
+                            tool_mode = True
+                            full_think = think_content
                             continue
 
-                        # Check for tool call start in cumulative content
-                        if has_tools and not tool_mode:
-                            stripped = current.strip()
-                            if is_tool_call_start(stripped):
-                                tool_mode = True
-                                tool_content_start = 0
-                                continue
-
-                        # Normal content: compute and emit delta
-                        if len(current) > len(prev_content):
-                            delta_text = current[len(prev_content):]
-                            prev_content = current
-                            delta_chunk = _make_chunk({"content": delta_text})
+                    # Emit reasoning_content delta (thinking mode)
+                    if is_thinking and think_content:
+                        if len(think_content) > len(prev_think):
+                            think_delta = think_content[len(prev_think):]
+                            prev_think = think_content
+                            full_think = think_content
+                            delta_chunk = _make_chunk({
+                                "reasoning_content": think_delta
+                            })
                             yield f"data: {json.dumps(delta_chunk, ensure_ascii=False)}\n\n"
+
+                    # Emit content delta
+                    if len(clean_content) > len(prev_content):
+                        delta_text = clean_content[len(prev_content):]
+                        prev_content = clean_content
+                        delta_chunk = _make_chunk({"content": delta_text})
+                        yield f"data: {json.dumps(delta_chunk, ensure_ascii=False)}\n\n"
 
         except Exception as e:
             log.error("Qianwen stream error: %s", e)
             err_chunk = _make_chunk({"content": f"[Stream error: {e}]"})
             yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
 
-        # After stream ends: check if we buffered tool calls
-        if tool_mode and has_tools:
-            parsed = parse_tool_calls_xml(full_content)
+        # After stream ends: check for tool calls in both content and think_content
+        if has_tools and (tool_mode or full_think or full_content):
+            # Try think_content first (thinking mode puts tool calls there)
+            source = full_think if full_think else full_content
+            parsed = parse_tool_calls_xml(source)
+            # Also try main content if think didn't have it
+            if not parsed and full_content:
+                parsed = parse_tool_calls_xml(full_content)
             if parsed:
-                # Emit tool_calls in OpenAI streaming format
                 for idx, tc in enumerate(parsed):
                     tc_delta = {
                         "role": "assistant",
@@ -809,8 +868,6 @@ def create_app(
                         }],
                     }
                     yield f"data: {json.dumps(_make_chunk(tc_delta), ensure_ascii=False)}\n\n"
-
-                # Final chunk
                 final_chunk = _make_chunk({}, finish_reason="tool_calls")
                 yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"

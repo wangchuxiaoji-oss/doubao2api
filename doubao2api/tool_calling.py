@@ -2,8 +2,13 @@
 Tool Calling support for doubao2api.
 
 Converts OpenAI-format tools into prompt injection,
-parses XML tool_calls from model output,
+parses tool_call tags from model output (official Qianwen format),
 and converts back to OpenAI-format response.
+
+Official format:
+  <tool_call>
+  {"name": "func_name", "arguments": {"key": "value"}}
+  </tool_call>
 """
 import json
 import re
@@ -21,19 +26,24 @@ TOOL_SYSTEM_PROMPT = """你是一个工具调用助手。你只能通过调用�
 
 {tool_definitions}
 
-当你需要调用工具时，请严格使用以下XML格式输出，不要添加任何其他内容：
-<tool_calls>
-<invoke name="工具名">
-<parameter name="参数名">参数值</parameter>
-</invoke>
-</tool_calls>
+当你需要调用工具时，请严格使用以下格式输出：
+<tool_call>
+{{"name": "工具名", "arguments": {{"参数名": "参数值"}}}}
+</tool_call>
+
+如果需要并行调用多个工具，输出多个<tool_call>块：
+<tool_call>
+{{"name": "工具1", "arguments": {{...}}}}
+</tool_call>
+<tool_call>
+{{"name": "工具2", "arguments": {{...}}}}
+</tool_call>
 
 重要规则：
 1. 你没有联网能力，不能直接搜索信息，必须通过上述工具获取所有外部信息
-2. 如果需要调用工具，只输出XML格式的工具调用，不要有任何解释文字
-3. 你可以在一个<tool_calls>块中包含多个<invoke>来并行调用多个工具
-4. 如果用户的问题不需要使用工具就能回答，直接用自然语言回答
-5. 不要编造数据，必须通过工具获取"""
+2. 如果需要调用工具，只输出<tool_call>格式的工具调用，不要有任何解释文字
+3. 如果用户的问题不需要使用工具就能回答，直接用自然语言回答
+4. 不要编造数据，必须通过工具获取"""
 
 TOOL_RESULT_TEMPLATE = "[工具调用结果]\n{name} 返回：{content}"
 
@@ -77,9 +87,15 @@ def build_tool_system_prompt(tools: list[dict[str, Any]]) -> str:
     return TOOL_SYSTEM_PROMPT.format(tool_definitions=tool_defs)
 
 
-# ── XML Parser for tool_calls ──
+# ── Parser for <tool_call> blocks (official Qianwen format) ──
 
-# Regex patterns for parsing XML tool calls
+# Matches individual <tool_call>...</tool_call> blocks
+_TOOL_CALL_RE = re.compile(
+    r"<tool_call>\s*(.*?)\s*</tool_call>",
+    re.DOTALL,
+)
+
+# Legacy format support (for backward compat with old model outputs)
 _TOOL_CALLS_RE = re.compile(
     r"<tool_calls>\s*(.*?)\s*</tool_calls>",
     re.DOTALL,
@@ -95,37 +111,60 @@ _PARAM_RE = re.compile(
 
 
 def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
-    """Parse XML tool_calls from model output.
+    """Parse tool_call blocks from model output.
     
-    Returns list of OpenAI-format tool_call dicts, or None if no tool calls found.
+    Supports both:
+    - Official format: <tool_call>{"name":..., "arguments":...}</tool_call>
+    - Legacy format: <tool_calls><invoke name="...">...</invoke></tool_calls>
+    
+    Returns list of OpenAI-format tool_call dicts, or None if not found.
     """
+    tool_calls = []
+    
+    # Try official format first
+    for m in _TOOL_CALL_RE.finditer(text):
+        json_str = m.group(1).strip()
+        try:
+            obj = json.loads(json_str)
+            name = obj.get("name", "")
+            arguments = obj.get("arguments", {})
+            if isinstance(arguments, dict):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            elif not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            })
+        except (json.JSONDecodeError, TypeError) as e:
+            log.warning("Failed to parse tool_call JSON: %s", e)
+            continue
+    
+    if tool_calls:
+        return tool_calls
+    
+    # Fallback: legacy <tool_calls><invoke> format
     match = _TOOL_CALLS_RE.search(text)
     if not match:
         return None
-    
     inner = match.group(1)
-    tool_calls = []
-    
     for invoke_match in _INVOKE_RE.finditer(inner):
         func_name = invoke_match.group(1)
         params_text = invoke_match.group(2)
-        
-        # Parse parameters into a dict
         arguments = {}
         for param_match in _PARAM_RE.finditer(params_text):
             param_name = param_match.group(1)
             param_value = param_match.group(2).strip()
             arguments[param_name] = param_value
-        
-        tool_call = {
+        tool_calls.append({
             "id": f"call_{uuid.uuid4().hex[:24]}",
             "type": "function",
             "function": {
                 "name": func_name,
                 "arguments": json.dumps(arguments, ensure_ascii=False),
             },
-        }
-        tool_calls.append(tool_call)
+        })
     
     return tool_calls if tool_calls else None
 
@@ -133,12 +172,14 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
 def is_tool_call_start(text: str) -> bool:
     """Check if accumulated text looks like the start of a tool call."""
     stripped = text.strip()
-    return stripped.startswith("<tool_calls>") or stripped.startswith("<tool_call")
+    return (stripped.startswith("<tool_call>") or 
+            stripped.startswith("<tool_call\n") or
+            stripped.startswith("<tool_calls>"))
 
 
 def has_complete_tool_calls(text: str) -> bool:
-    """Check if text contains a complete <tool_calls>...</tool_calls> block."""
-    return "</tool_calls>" in text
+    """Check if text contains at least one complete tool_call block."""
+    return "</tool_call>" in text or "</tool_calls>" in text
 
 
 # ── Message conversion for multi-turn tool use ──
@@ -201,8 +242,8 @@ def convert_messages_with_tools(
 
 
 def _reconstruct_tool_calls_xml(tool_calls: list[dict[str, Any]]) -> str:
-    """Reconstruct XML from OpenAI-format tool_calls for context continuity."""
-    lines = ["<tool_calls>"]
+    """Reconstruct <tool_call> blocks from OpenAI-format tool_calls for context."""
+    parts = []
     for tc in tool_calls:
         func = tc.get("function", {})
         name = func.get("name", "")
@@ -211,10 +252,6 @@ def _reconstruct_tool_calls_xml(tool_calls: list[dict[str, Any]]) -> str:
             args = json.loads(args_str)
         except (json.JSONDecodeError, TypeError):
             args = {}
-        
-        lines.append(f'<invoke name="{name}">')
-        for pname, pvalue in args.items():
-            lines.append(f'<parameter name="{pname}">{pvalue}</parameter>')
-        lines.append("</invoke>")
-    lines.append("</tool_calls>")
-    return "\n".join(lines)
+        obj = {"name": name, "arguments": args}
+        parts.append(f"<tool_call>\n{json.dumps(obj, ensure_ascii=False)}\n</tool_call>")
+    return "\n".join(parts)

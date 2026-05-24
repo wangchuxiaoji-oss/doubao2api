@@ -36,10 +36,11 @@ CHAT_API_URL = "https://chat2.qianwen.com/api/v2/chat"
 QIANWEN_MODELS = {
     "qianwen": {"model": "Qwen", "deep_search": "0"},
     "qianwen-max": {"model": "Qwen3.7-Max", "deep_search": "0"},
+    "qianwen-max-think": {"model": "Qwen3.7-Max", "deep_search": "1"},
     "qianwen-think": {"model": "Qwen3-Max-Thinking-Preview", "deep_search": "0"},
     "qianwen-coder": {"model": "Qwen3-Coder", "deep_search": "0"},
     "qianwen-flash": {"model": "Qwen3.5-Flash", "deep_search": "0"},
-    "qianwen-search": {"model": "Qwen", "deep_search": "1"},
+    "qianwen-search": {"model": "Qwen3.7-Max", "deep_search": "1"},
     # Direct model codes (pass-through)
     "Qwen": {"model": "Qwen", "deep_search": "0"},
     "Qwen3.7-Max": {"model": "Qwen3.7-Max", "deep_search": "0"},
@@ -389,9 +390,10 @@ class QianwenClient:
         """Send message, collect full response.
 
         Returns:
-            Dict with 'content', 'model', 'usage' keys
+            Dict with 'content', 'think_content', 'model', 'usage' keys
         """
         full_content = ""
+        full_think = ""
         usage = {}
         actual_model = ""
 
@@ -404,6 +406,15 @@ class QianwenClient:
             for msg in msgs:
                 if msg.get("mime_type") == "multi_load/iframe" and msg.get("content"):
                     full_content = msg["content"]  # cumulative
+                    # Extract think_content from meta_data
+                    meta = msg.get("meta_data", {})
+                    multi_load = meta.get("multi_load", [])
+                    if multi_load and isinstance(multi_load, list):
+                        ml_content = multi_load[0].get("content", {})
+                        if isinstance(ml_content, dict):
+                            tc = ml_content.get("think_content", "")
+                            if tc:
+                                full_think = tc
 
             # Extract usage from final chunks
             extra = data.get("extra_info", {})
@@ -416,6 +427,7 @@ class QianwenClient:
         self.record_success()
         return {
             "content": full_content,
+            "think_content": full_think,
             "model": actual_model or model,
             "usage": usage,
         }
