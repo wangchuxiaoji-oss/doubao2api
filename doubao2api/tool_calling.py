@@ -126,6 +126,26 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
         json_str = m.group(1).strip()
         try:
             obj = json.loads(json_str)
+        except json.JSONDecodeError:
+            # Try to fix common model output issues:
+            # 1. Unquoted values like {name: get_weather} -> {"name": "get_weather"}
+            fixed = re.sub(
+                r'(?<=[{,:])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(?=[,}])',
+                r' "\1"',
+                json_str,
+            )
+            # 2. Unquoted keys
+            fixed = re.sub(
+                r'(?<=[{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:',
+                r' "\1":',
+                fixed,
+            )
+            try:
+                obj = json.loads(fixed)
+            except (json.JSONDecodeError, TypeError) as e:
+                log.warning("Failed to parse tool_call JSON even after fix: %s | raw: %s", e, json_str[:200])
+                continue
+        try:
             name = obj.get("name", "")
             arguments = obj.get("arguments", {})
             if isinstance(arguments, dict):
@@ -137,8 +157,8 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
                 "type": "function",
                 "function": {"name": name, "arguments": arguments},
             })
-        except (json.JSONDecodeError, TypeError) as e:
-            log.warning("Failed to parse tool_call JSON: %s", e)
+        except (AttributeError, TypeError) as e:
+            log.warning("Failed to extract tool_call fields: %s", e)
             continue
     
     if tool_calls:
