@@ -649,11 +649,19 @@ def create_app(
         # ── Tool calling: inject tool definitions into prompt ──
         has_tools = bool(body.tools)
         if has_tools:
+            # Log input breakdown for debugging
+            num_tools = len(body.tools) if body.tools else 0
+            sys_msg = next((m for m in messages_raw if m.get("role") == "system"), None)
+            sys_len = len(sys_msg.get("content", "")) if sys_msg else 0
+            tool_msgs = [m for m in messages_raw if m.get("role") == "tool"]
+            log.info("Qianwen input: %d msgs, %d tools, sys=%d chars, %d tool_results",
+                     len(messages_raw), num_tools, sys_len, len(tool_msgs))
+
             prompt = convert_messages_with_tools(messages_raw, body.tools)
-            log.info("Qianwen tool prompt: %d chars, %d messages in request",
-                     len(prompt), len(messages_raw))
+            log.info("Qianwen prompt after flatten: %d chars (%dKB)",
+                     len(prompt), len(prompt) // 1024)
             if len(prompt) > 50000:
-                log.warning("Qianwen prompt VERY LONG: %d chars — may hit API limit!", len(prompt))
+                log.warning("Qianwen prompt OVER LIMIT: %d chars — truncation active", len(prompt))
             # Wrap as single user message for Qianwen
             messages_for_qw = [{"role": "user", "content": prompt}]
         else:
